@@ -106,7 +106,7 @@ pub enum Msg {
         // for notifying manager that a lock request is granted
         from_name: String,
         lock: Lock,
-        pred_id: Option<TxnId>, // txn id that has been appied by the var actor
+        pred_id: Option<TxnId>, // txn id that has been applied by the var actor
     },
     LockAbort {
         // for notifying manager that a lock request is aborted

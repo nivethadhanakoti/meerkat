@@ -24,7 +24,7 @@ pub struct AppliedChanges {
     /// we don't need to keep it at all
     pub dropped: HashSet<ChangeId>,
 
-    /// key: writed var v
+    /// key: written var v
     /// value: latest txn writes to v, together with the change it belongs to
     pub write_to_changes: HashMap<String, (TxnId, ChangeId)>,
 }

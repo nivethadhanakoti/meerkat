@@ -19,11 +19,11 @@ fn from_num<'b>(lex: &mut Lexer<'b, Token<'b>>) -> Result<i32, String> {
     let res = slice.parse();
 
     if res.is_err() {
-        return Err(format!("Parsing failed wtih Error {:?}", res.unwrap_err()));
+        return Err(format!("Parsing failed with Error {:?}", res.unwrap_err()));
     }
     let out: i64 = res.unwrap();
     if out > ((i32::MIN as i64).abs()) {
-        // All numbers are positive because - is lexed seperately
+        // All numbers are positive because - is lexed separately
         return Err(format!("Number {} is out of bounds", out));
     }
 

@@ -42,6 +42,6 @@ impl PubSub {
 
 // todo:
 // 1. make pubsub more generic, as a template
-// 2. more functionalites
+// 2. more functionalities
 // 3. more fault tolerance
 // 4. models other than direct publish to subscribers

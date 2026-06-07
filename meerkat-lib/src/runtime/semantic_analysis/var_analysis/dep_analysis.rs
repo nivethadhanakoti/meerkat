@@ -42,7 +42,7 @@ impl DependAnalysis {
             tables,
             dep_graph,
             topo_order: Vec::new(),
-            dep_transtive: HashMap::new(),
+            dep_transitive: HashMap::new(),
             dep_vars: HashMap::new(),
         }
     }
@@ -113,7 +113,7 @@ impl DependAnalysis {
                 &self.tables,
                 &mut visited,
                 &mut self.topo_order,
-                &mut self.dep_transtive,
+                &mut self.dep_transitive,
                 name
             );
         }
@@ -122,7 +122,7 @@ impl DependAnalysis {
         for name in self.vars.iter().chain(self.defs.iter().chain(self.tables.iter())) {
             self.dep_vars.insert(
                 name.clone(),
-                self.dep_transtive
+                self.dep_transitive
                     .get(name)
                     .expect(&format!("cannot find def {} in trans dep", name))
                     .intersection(&vars_and_tables)

@@ -147,12 +147,12 @@ impl TypecheckEnv {
 
             Expr::Call { func, args } => {
                 let func_typ = self.infer_expr(func);
-                if let Type::Fun(arg_typs, ret_typ) = func_typ {
-                    if arg_typs.len() != args.len() {
+                if let Type::Fun(arg_types, ret_typ) = func_typ {
+                    if arg_types.len() != args.len() {
                         panic!("wrong number of argument to apply");
                     } else {
                         for (i, arg) in args.iter().enumerate() {
-                            let typ_i: &Type = &arg_typs[i];
+                            let typ_i: &Type = &arg_types[i];
                             let typ_i_actual = self.infer_expr(arg);
                             if !self.unify(typ_i, &typ_i_actual) {
                                 panic!(
@@ -166,9 +166,9 @@ impl TypecheckEnv {
                     }
                 } else {
                     let ret_typ = self.gen_typevar();
-                    let arg_typs = args.iter().map(|a| self.infer_expr(a)).collect();
+                    let arg_types = args.iter().map(|a| self.infer_expr(a)).collect();
 
-                    let func_typ_actual = Type::Fun(arg_typs, Box::new(ret_typ.clone()));
+                    let func_typ_actual = Type::Fun(arg_types, Box::new(ret_typ.clone()));
 
                     if !self.unify(&func_typ, &func_typ_actual) {
                         panic!(

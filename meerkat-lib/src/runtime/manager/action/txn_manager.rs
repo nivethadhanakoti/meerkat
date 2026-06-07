@@ -54,7 +54,7 @@ impl TxnManager {
     /// when receive a finished write from name ..
     pub fn add_finished_write(&mut self, name: String) {
         assert!(self.writes.get(&name) == Some(WriteState::Granted).as_ref());
-        self.writes.insert(name, WriteState::Writed);
+        self.writes.insert(name, WriteState::Written);
     }
 
     /// check if all locks are granted
@@ -85,7 +85,7 @@ impl TxnManager {
 
     /// check if all writes are finished
     pub fn all_write_finished(&self) -> bool {
-        self.writes.iter().all(|(_, v)| *v == WriteState::Writed)
+        self.writes.iter().all(|(_, v)| *v == WriteState::Written)
     }
 
     /// record that the transaction is aborted due to lock aborted

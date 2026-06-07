@@ -50,7 +50,7 @@ pub enum WriteState {
     Requested, // default
     Granted,   // lock granted
     Aborted,   // lock aborted
-    Writed,    // successfully write to name
+    Written,    // successfully write to name
 }
 
 impl TxnManager {

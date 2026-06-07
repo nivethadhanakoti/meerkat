@@ -11,7 +11,7 @@
 //! We treat each assertion as a weaker form of transaction + 2 phase process
 //! - no explicit transaction id
 //! - since assertion is read only, (Phase 1)
-//!   trans_read requests are sended to relevant var actors
+//!   trans_read requests are sent to relevant var actors
 //!   who send back pred txn immediately (no acquisition for read lock)
 //! - (Phase 2) send UsrReadDefRequest to assertion def actor
 //!   when hearing back from the def actor, send back AssertComplete

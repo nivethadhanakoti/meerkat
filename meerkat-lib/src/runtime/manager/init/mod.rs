@@ -19,7 +19,7 @@ pub mod alloc_actors;
 
 impl Manager {
     pub async fn alloc_service(&mut self, srv: &Service) {
-        // intial evaluation of srv
+        // initial evaluation of srv
         self.evaluator = eval_srv(srv);
 
         let srv_info = calc_dep_srv(srv);

@@ -14,7 +14,7 @@ pub mod state;
 /**
  *
  * var x := 1
- *  intialized
+ *  initialized
  *  -> receive lock request
  *  -> managing lock
  * -> grant lock

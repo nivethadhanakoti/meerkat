@@ -32,7 +32,7 @@ pub struct Manager {
     /// analysis and initial evaluation of program stored at manager
     /// todo!("probably can use for later eval of program")
     /// then manager need regularly fetch values from var/def actors
-    /// might be benefitial
+    /// might be beneficial
     pub evaluator: Evaluator,
 
     /// dependency graph

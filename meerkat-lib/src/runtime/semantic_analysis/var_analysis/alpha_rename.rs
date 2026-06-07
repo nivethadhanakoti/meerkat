@@ -5,7 +5,7 @@ use crate::ast::{Expr, ActionStmt};
 
 impl Expr {
     /// alpha renaming of expression e
-    /// rename x1, x2, ..., x_n to y1, y2, ..., y_n if x is free in expresion e
+    /// rename x1, x2, ..., x_n to y1, y2, ..., y_n if x is free in expression e
     pub fn alpha_rename(
         &mut self,
         var_binded: &HashSet<String>,

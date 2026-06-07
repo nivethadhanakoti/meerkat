@@ -19,7 +19,7 @@ impl kameo::prelude::Message<Msg> for TableActor {
 
         match msg {
             Msg::Subscribe { from_name: _, from_addr } => {
-                info!("Subsribe from {:?}", from_addr);
+                info!("Subscribe from {:?}", from_addr);
                 self.pubsub.subscribe(from_addr);
                 Msg::SubscribeGranted {
                     name: self.name.clone(),

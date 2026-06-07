@@ -14,7 +14,7 @@ impl Type {
             // Calculate free type var in function type
             // e.g. (a, int, bool) -> b has free_var
             // for convenience, we clone the whole type bindings from previous
-            // level, if perfomance matters, we can switch to a stack of type
+            // level, if performance matters, we can switch to a stack of type
             // binds to efficiently maintain type bindings
             Type::Fun(params, ret) => {
                 let mut typ_var_binded: HashSet<String> = typ_var_binded.clone();
