@@ -130,6 +130,26 @@ pub enum MeerkatMessage {
     /// (wait-die wait): tells the waiting originator the request is alive and
     /// still queued, so it keeps waiting instead of timing out.
     WaitParked { request_id: u64 },
+
+    /// #24: a listener registering for change notifications on members of a
+    /// remote service. The owner adds (listener_service, listener_def) to each
+    /// named member's listener set and replies with the current values as
+    /// Update messages.
+    RequestUpdates {
+        request_id: u64,
+        listener_service: crate::net::ServiceId,
+        listener_def: String,
+        members: Vec<String>,
+        reply_to: String,
+    },
+
+    /// #24: a change notification pushed to a listener: one member of the source
+    /// service changed (or carries its current value on first subscribe).
+    Update {
+        source_service: crate::net::ServiceId,
+        member: String,
+        value: String, // JSON-serialized Value
+    },
 }
 
 /// Errors that can occur when sending

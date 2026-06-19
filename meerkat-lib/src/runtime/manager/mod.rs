@@ -16,6 +16,17 @@ pub struct Service {
     pub vars: HashMap<String, VarState>,
     pub defs: HashMap<String, Expr>, // original def expressions for re-evaluation
     pub dep: DependAnalysis,         // dependency graph + topo order
+    /// #24: who depends on each of this service's members, keyed uniformly by
+    /// listener identity (ServiceId, def name) whether local or on another node.
+    /// member -> set of (listener service, listener def).
+    pub listeners: HashMap<String, HashSet<(ServiceId, String)>>,
+    /// #24: cached values of each local def's direct cross-service deps, so a
+    /// reactive recompute resolves a reference like s1.y from here instead of
+    /// going to the network. def -> ((source service, member) -> value).
+    pub dep_cache: HashMap<String, HashMap<(ServiceId, String), Value>>,
+    /// #24: each local def's direct cross-service deps as (service, member),
+    /// extracted from its expression at construction (free_var omits these).
+    pub dep_remote: HashMap<String, HashSet<(String, String)>>,
 }
 
 /// A remote request parked on a variable's wait queue because the requesting
@@ -198,6 +209,19 @@ impl Manager {
     ) -> Result<(), EvalError> {
         let dep = calc_dep_srv(&decls);
 
+        // #24: extract each def's direct cross-service deps now, while we still
+        // own decls. free_var drops MemberAccess, so this is the only place a
+        // reference like s1.y becomes visible to the runtime.
+        let mut dep_remote: HashMap<String, HashSet<(String, String)>> = HashMap::new();
+        for decl in &decls {
+            if let Decl::DefDecl { name, val, .. } = decl {
+                let refs = val.cross_service_deps();
+                if !refs.is_empty() {
+                    dep_remote.insert(name.clone(), refs);
+                }
+            }
+        }
+
         let id = self.service_identity(&name);
         // Register the service (with its real ServiceId) before evaluating any
         // declarations, so action closures built during initialization are
@@ -211,6 +235,9 @@ impl Manager {
                 vars: HashMap::new(),
                 defs: HashMap::new(),
                 dep,
+                listeners: HashMap::new(),
+                dep_cache: HashMap::new(),
+                dep_remote,
             },
         );
 
