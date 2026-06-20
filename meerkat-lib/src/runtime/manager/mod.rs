@@ -223,6 +223,25 @@ impl Manager {
         }
 
         let id = self.service_identity(&name);
+
+        // #24: register local listeners up front. For each def, every direct
+        // local dependency (a var or def in this same service) gets this def
+        // added to its listener set, keyed by this service's own id. A local
+        // change then walks these edges instead of scanning every def in topo
+        // order. Cross-service deps are subscribed over the wire in a later
+        // stage, so they are intentionally absent here.
+        let mut listeners: HashMap<String, HashSet<(ServiceId, String)>> = HashMap::new();
+        for def_name in &dep.defs {
+            if let Some(direct) = dep.dep_graph.get(def_name) {
+                for dep_member in direct {
+                    listeners
+                        .entry(dep_member.clone())
+                        .or_default()
+                        .insert((id.clone(), def_name.clone()));
+                }
+            }
+        }
+
         // Register the service (with its real ServiceId) before evaluating any
         // declarations, so action closures built during initialization are
         // stamped with the correct ServiceId instead of id_for_service's
@@ -235,7 +254,7 @@ impl Manager {
                 vars: HashMap::new(),
                 defs: HashMap::new(),
                 dep,
-                listeners: HashMap::new(),
+                listeners,
                 dep_cache: HashMap::new(),
                 dep_remote,
             },
@@ -423,72 +442,94 @@ impl Manager {
     }
 
     async fn propagate(&mut self, service_name: &str, changed_var: &str) {
-        // collect defs that need re-evaluation in topo order
-        let topo_order: Vec<String> = self
-            .services
-            .get(service_name)
-            .map(|s| s.dep.topo_order.clone())
-            .unwrap_or_default();
+        // #24: event-driven local reactivity. Rather than scanning every def in
+        // topo order, walk the listener edges outward from the changed member:
+        // each local listener recomputes from current values and, when its own
+        // value changes, cascades to the members listening on it. This is the
+        // same mechanism cross-service updates use; only the transport differs.
+        // Remote listeners are notified over the wire in a later stage.
+        let self_id = match self.services.get(service_name) {
+            Some(s) => s.id.clone(),
+            None => return,
+        };
 
-        for def_name in topo_order {
-            let needs_update = self
+        let mut worklist: Vec<String> = vec![changed_var.to_string()];
+        while let Some(member) = worklist.pop() {
+            // Local defs listening on this member, cloned out so that no borrow
+            // of self is held across the recompute below.
+            let listening_defs: Vec<String> = self
                 .services
                 .get(service_name)
-                .and_then(|s| s.dep.dep_vars.get(&def_name))
-                .map(|dep_vars| dep_vars.contains(changed_var))
-                .unwrap_or(false);
+                .and_then(|s| s.listeners.get(&member))
+                .map(|set| {
+                    set.iter()
+                        .filter(|(sid, _)| *sid == self_id)
+                        .map(|(_, def_name)| def_name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
 
-            let is_def = self
-                .services
-                .get(service_name)
-                .map(|s| s.defs.contains_key(&def_name))
-                .unwrap_or(false);
-
-            if needs_update && is_def {
-                // build env from current var values
-                let expr = self
+            for def_name in listening_defs {
+                let expr = match self
                     .services
                     .get(service_name)
                     .and_then(|s| s.defs.get(&def_name))
-                    .cloned();
+                    .cloned()
+                {
+                    Some(e) => e,
+                    None => continue,
+                };
 
-                if let Some(expr) = expr {
-                    let env: Vec<(String, Value)> = self
-                        .services
-                        .get(service_name)
-                        .map(|s| {
-                            s.vars
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.value.clone()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                // Recompute from the service's current values, lockless, exactly
+                // as the previous topo-walk did.
+                let env: Vec<(String, Value)> = self
+                    .services
+                    .get(service_name)
+                    .map(|s| {
+                        s.vars
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.value.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
 
-                    let value = match eval(
-                        &expr,
-                        &env,
-                        &mut EvalContext {
-                            manager: self,
-                            service_name,
-                            txn: None,
-                        },
-                    )
-                    .await
-                    {
-                        Ok(v) => v,
-                        Err(e) => {
-                            // Propagation is best-effort; durable retry of failed
-                            // updates is tracked under issue #24 (async updates).
-                            log::warn!("propagation of def '{}' failed: {}", def_name, e);
-                            continue;
-                        }
-                    };
-
-                    if let Some(service) = self.services.get_mut(service_name) {
-                        if let Some(var_state) = service.vars.get_mut(&def_name) {
-                            var_state.value = value;
-                        }
+                let value = match eval(
+                    &expr,
+                    &env,
+                    &mut EvalContext {
+                        manager: self,
+                        service_name,
+                        txn: None,
+                    },
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Propagation is best-effort; durable retry of failed
+                        // updates is tracked under issue #24 (async updates).
+                        log::warn!("propagation of def '{}' failed: {}", def_name, e);
+                        continue;
                     }
+                };
+
+                // Write the new value back; cascade only when it actually
+                // changed, so a no-op recompute does not re-trigger dependents.
+                let changed = match self
+                    .services
+                    .get_mut(service_name)
+                    .and_then(|s| s.vars.get_mut(&def_name))
+                {
+                    Some(var_state) => {
+                        let differs = var_state.value != value;
+                        var_state.value = value;
+                        differs
+                    }
+                    None => false,
+                };
+
+                if changed {
+                    worklist.push(def_name);
                 }
             }
         }
