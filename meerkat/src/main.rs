@@ -45,6 +45,11 @@ struct Args {
     /// Emit AST to `stdout`
     #[arg(long = "ast", default_value_t = false)]
     ast: bool,
+
+    /// Watch mode: subscribe to the file's dependencies and print change
+    /// notifications as they arrive (no REPL).
+    #[arg(long = "watch", default_value_t = false)]
+    watch: bool,
 }
 
 #[tokio::main]
@@ -97,12 +102,14 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
 
             if args.server {
                 run_server(prog, remote_url_map, args.port, args.local).await
+            } else if args.watch {
+                run_watch(prog, file, remote_url_map, args.local).await
             } else {
                 run_client(prog, file, remote_url_map, args.local).await
             }
         }
         None => {
-            if args.server || args.check_only || args.ast {
+            if args.server || args.check_only || args.ast || args.watch {
                 return Err(
                     "Expected a .mkt file (-f) for --server, --check, or --ast mode.".into(),
                 );
@@ -442,6 +449,55 @@ async fn run_server(
                     // abort just released.
                     wake_ready(&mut manager, freed).await;
                 }
+                // #24: a remote listener subscribes to our services' members.
+                MeerkatMessage::RequestUpdates {
+                    service,
+                    members,
+                    listener_service,
+                    listener_def,
+                    reply_to,
+                    ..
+                } => {
+                    let updates = manager.handle_request_updates(
+                        &service,
+                        &members,
+                        listener_service,
+                        &listener_def,
+                        &reply_to,
+                    );
+                    for update in updates {
+                        if let Some(net) = manager.network.as_mut() {
+                            net.handle_command(NetworkCommand::SendMessage {
+                                addr: Address::new(&reply_to),
+                                msg: update,
+                            })
+                            .await;
+                        }
+                    }
+                }
+                // #24: a notification for a def we host that depends on another
+                // node (a server can also be a listener).
+                MeerkatMessage::Update {
+                    listener_service,
+                    listener_def,
+                    source_service,
+                    member,
+                    value,
+                } => {
+                    if let Ok(parsed) =
+                        serde_json::from_str::<meerkat_lib::runtime::ast::Value>(&value)
+                    {
+                        manager
+                            .handle_update(
+                                listener_service,
+                                &listener_def,
+                                &source_service,
+                                &member,
+                                parsed,
+                            )
+                            .await;
+                    }
+                }
                 _ => {}
             }
         }
@@ -542,4 +598,129 @@ async fn run_client(
     }
 
     Ok(())
+}
+
+/// #24: watch mode. Load the program (which subscribes to remote dependencies
+/// via RequestUpdates as each service is created), then loop receiving Update
+/// notifications, applying each to local state and printing it as it arrives.
+async fn run_watch(
+    prog: Vec<Stmt>,
+    input_file: &str,
+    remote_url_map: std::collections::HashMap<String, String>,
+    local: bool,
+) -> Result<(), Box<dyn Error>> {
+    let mut manager = Manager::new();
+    manager.local = local;
+
+    let mut net: Option<NetworkActor> = None;
+    let mut local_full_addr: Option<String> = None;
+    if !remote_url_map.is_empty() {
+        let mut n = NetworkActor::new(NodeType::Server)
+            .await
+            .map_err(|e| format!("Network error: {}", e))?;
+        let listen_ip = if local { "127.0.0.1" } else { "0.0.0.0" };
+        let listen_addr = Address::new(format!("/ip4/{}/tcp/0", listen_ip));
+        let reply = n
+            .handle_command(NetworkCommand::Listen { addr: listen_addr })
+            .await;
+        if let meerkat_lib::net::NetworkReply::ListenSuccess { addr } = reply {
+            let node_ip = manager.get_node_ip();
+            let peer_id = n.local_peer_id();
+            let addr_str = addr
+                .0
+                .replace("0.0.0.0", &node_ip)
+                .replace("127.0.0.1", &node_ip);
+            local_full_addr = Some(format!("{}/p2p/{}", addr_str, peer_id));
+        }
+        net = Some(n);
+    }
+    if let Some(n) = net {
+        manager.network = Some(n);
+    }
+    if let Some(addr) = local_full_addr {
+        manager.set_local_address(addr);
+    }
+
+    // Register remote imports first so cross-service deps resolve when services
+    // are created (creation is what sends the RequestUpdates subscriptions).
+    for stmt in &prog {
+        if let Stmt::Import {
+            path,
+            service: svc_name,
+        } = stmt
+        {
+            if let Some(url) = remote_url_map.get(svc_name) {
+                manager
+                    .remote_services
+                    .insert(svc_name.clone(), Address::new(url.as_str()));
+                println!("Remote service '{}' registered at {}", svc_name, url);
+            } else {
+                let base_dir = std::path::Path::new(input_file)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."));
+                let import_path = base_dir.join(path);
+                let import_stmts =
+                    meerkat_lib::runtime::parser::parse_file(import_path.to_str().unwrap())
+                        .map_err(|e| format!("Import parse error: {}", e))?;
+                for import_stmt in &import_stmts {
+                    if let Stmt::Service { name, decls } = import_stmt {
+                        manager
+                            .create_service(name.clone(), decls.clone())
+                            .await
+                            .map_err(|e| format!("Import service error: {}", e))?;
+                    }
+                }
+            }
+        }
+    }
+    for stmt in &prog {
+        if let Stmt::Service { name, decls } = stmt {
+            manager
+                .create_service(name.clone(), decls.clone())
+                .await
+                .map_err(|e| format!("Service error: {}", e))?;
+            println!("Service '{}' loaded", name);
+        }
+    }
+
+    println!("Watching for changes, press Ctrl+C to stop...");
+    loop {
+        let event = manager.network.as_mut().and_then(|n| n.try_recv_event());
+        if let Some(NetworkEvent::MessageReceived {
+            msg:
+                MeerkatMessage::Update {
+                    listener_service,
+                    listener_def,
+                    source_service,
+                    member,
+                    value,
+                },
+            ..
+        }) = event
+        {
+            println!("[update] {}.{} = {}", source_service, member, value);
+            if let Ok(parsed) = serde_json::from_str::<meerkat_lib::runtime::ast::Value>(&value) {
+                let lid = listener_service.clone();
+                manager
+                    .handle_update(
+                        listener_service,
+                        &listener_def,
+                        &source_service,
+                        &member,
+                        parsed,
+                    )
+                    .await;
+                if let Some((_, svc)) = manager.services.iter().find(|(_, s)| s.id == lid) {
+                    if let Some(vs) = svc.vars.get(&listener_def) {
+                        println!(
+                            "          -> {} = {}",
+                            listener_def,
+                            serde_json::to_string(&vs.value).unwrap_or_default()
+                        );
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
 }
