@@ -1338,6 +1338,103 @@ mod tests {
     use super::*;
     use crate::ast::{Decl, Expr, Value};
 
+    // #24: a def in one service that depends on another local service's member
+    // updates eagerly through the cross-service listener cascade, not only
+    // lazily on read. We assert against `vars` directly (a lookup would
+    // re-evaluate and mask whether the cascade actually fired).
+    #[tokio::test]
+    async fn test_cross_service_def_updates_eagerly() {
+        let mut manager = Manager::new();
+
+        // service s1 { var x = 1; pub def y = x + 1; }
+        let s1 = vec![
+            Decl::VarDecl {
+                name: "x".to_string(),
+                val: Expr::Literal {
+                    val: Value::Number { val: 1 },
+                },
+            },
+            Decl::DefDecl {
+                name: "y".to_string(),
+                val: Expr::Binop {
+                    op: crate::ast::BinOp::Add,
+                    expr1: Box::new(Expr::Variable {
+                        ident: "x".to_string(),
+                    }),
+                    expr2: Box::new(Expr::Literal {
+                        val: Value::Number { val: 1 },
+                    }),
+                },
+                is_pub: true,
+            },
+        ];
+        manager.create_service("s1".to_string(), s1).await.unwrap();
+
+        // service s2 { pub def z = s1.y + 2; }
+        let s2 = vec![Decl::DefDecl {
+            name: "z".to_string(),
+            val: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::MemberAccess {
+                    service: "s1".to_string(),
+                    member: "y".to_string(),
+                }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Number { val: 2 },
+                }),
+            },
+            is_pub: true,
+        }];
+        manager.create_service("s2".to_string(), s2).await.unwrap();
+
+        // s2.z must be registered as a listener on s1.y.
+        let registered = manager
+            .services
+            .get("s1")
+            .unwrap()
+            .listeners
+            .get("y")
+            .map(|set| set.iter().any(|(_, def)| def.as_str() == "z"))
+            .unwrap_or(false);
+        assert!(registered, "s2.z should be a listener on s1.y");
+
+        // Initial values: x=1, y=2, z = 2 + 2 = 4 (seeded at construction).
+        assert_eq!(
+            manager
+                .services
+                .get("s2")
+                .unwrap()
+                .vars
+                .get("z")
+                .unwrap()
+                .value,
+            Value::Number { val: 4 }
+        );
+
+        // Change s1.x to 4 (y becomes 5). This drives propagate on s1, which
+        // must cascade across the service boundary to recompute s2.z.
+        manager
+            .assign("s1", "x", Value::Number { val: 4 }, None)
+            .await
+            .unwrap();
+
+        // Eager check: read s2.vars[z] directly. If the cross-service cascade
+        // fired, z is already 7 (= 5 + 2). If nothing propagated across the
+        // boundary, it would still be its construction-time value of 4.
+        assert_eq!(
+            manager
+                .services
+                .get("s2")
+                .unwrap()
+                .vars
+                .get("z")
+                .unwrap()
+                .value,
+            Value::Number { val: 7 },
+            "s2.z should update eagerly via the cross-service listener cascade"
+        );
+    }
+
     #[tokio::test]
     async fn test_create_service_with_var() {
         let mut manager = Manager::new();
