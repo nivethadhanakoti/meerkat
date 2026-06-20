@@ -131,22 +131,32 @@ pub enum MeerkatMessage {
     /// still queued, so it keeps waiting instead of timing out.
     WaitParked { request_id: u64 },
 
-    /// #24: a listener registering for change notifications on members of a
-    /// remote service. The owner adds (listener_service, listener_def) to each
-    /// named member's listener set and replies with the current values as
-    /// Update messages.
+    /// #24: a listener subscribing to change notifications on members of a
+    /// service owned by the receiving node. The owner registers the listener,
+    /// records reply_to, and replies with each member's current value as an
+    /// Update.
     RequestUpdates {
         request_id: u64,
+        /// The owner service being subscribed to.
+        service: String,
+        /// Members of that service to subscribe to.
+        members: Vec<String>,
+        /// The subscribing def's identity, so Updates can be addressed back.
         listener_service: crate::net::ServiceId,
         listener_def: String,
-        members: Vec<String>,
+        /// Dialable address of the subscribing node.
         reply_to: String,
     },
 
-    /// #24: a change notification pushed to a listener: one member of the source
-    /// service changed (or carries its current value on first subscribe).
+    /// #24: a change notification pushed to a specific listener def: the
+    /// dependency it tracks (source_service.member) has a new value (also sent
+    /// once on subscribe to carry the initial value).
     Update {
-        source_service: crate::net::ServiceId,
+        /// Target listener: the owner addresses the notification to this def.
+        listener_service: crate::net::ServiceId,
+        listener_def: String,
+        /// Which dependency changed, named as the listener refers to it.
+        source_service: String,
         member: String,
         value: String, // JSON-serialized Value
     },

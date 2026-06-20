@@ -23,7 +23,7 @@ pub struct Service {
     /// #24: cached values of each local def's direct cross-service deps, so a
     /// reactive recompute resolves a reference like s1.y from here instead of
     /// going to the network. def -> ((source service, member) -> value).
-    pub dep_cache: HashMap<String, HashMap<(ServiceId, String), Value>>,
+    pub dep_cache: HashMap<String, HashMap<(String, String), Value>>,
     /// #24: each local def's direct cross-service deps as (service, member),
     /// extracted from its expression at construction (free_var omits these).
     pub dep_remote: HashMap<String, HashSet<(String, String)>>,
@@ -88,6 +88,9 @@ pub struct Manager {
     local_address: Option<String>,
     /// Enable local loopback mode
     pub local: bool,
+    /// #24: dialable address of each remote listener, keyed by its ServiceId,
+    /// recorded when it subscribes so change notifications can be sent back.
+    pub listener_addrs: HashMap<ServiceId, String>,
 }
 
 impl Manager {
@@ -102,6 +105,7 @@ impl Manager {
             wait_queue: HashMap::new(),
             local_address: None,
             local: false,
+            listener_addrs: HashMap::new(),
         }
     }
 
@@ -321,6 +325,9 @@ impl Manager {
                 }
             }
         }
+        // Local owner: register the listener in-process. Remote owner: gather
+        // for a wire subscription, grouped by (listener_def, owner) -> members.
+        let mut remote_subs: HashMap<(String, String), Vec<String>> = HashMap::new();
         for (def_name, owner, member) in cross_links {
             if let Some(owner_svc) = self.services.get_mut(&owner) {
                 owner_svc
@@ -328,7 +335,16 @@ impl Manager {
                     .entry(member)
                     .or_default()
                     .insert((this_id.clone(), def_name));
+            } else {
+                remote_subs
+                    .entry((def_name, owner))
+                    .or_default()
+                    .push(member);
             }
+        }
+        for ((def_name, owner), members) in remote_subs {
+            self.subscribe_remote(&owner, members, this_id.clone(), &def_name)
+                .await;
         }
 
         Ok(())
@@ -498,7 +514,34 @@ impl Manager {
                     .map(|(n, _)| n.clone())
                 {
                     Some(n) => n,
-                    None => continue,
+                    None => {
+                        // #24: the listener lives on another node. Push the
+                        // member's current value to it as an Update, addressed by
+                        // the reply_to it gave when it subscribed.
+                        let value = self
+                            .services
+                            .get(&svc)
+                            .and_then(|s| s.vars.get(&member))
+                            .map(|vs| vs.value.clone());
+                        let addr = self.listener_addrs.get(&listener_id).cloned();
+                        if let (Some(value), Some(addr)) = (value, addr) {
+                            let msg = MeerkatMessage::Update {
+                                listener_service: listener_id.clone(),
+                                listener_def: listener_def.clone(),
+                                source_service: svc.clone(),
+                                member: member.clone(),
+                                value: serde_json::to_string(&value).unwrap_or_default(),
+                            };
+                            if let Some(net) = self.network.as_mut() {
+                                net.handle_command(NetworkCommand::SendMessage {
+                                    addr: Address::new(addr.as_str()),
+                                    msg,
+                                })
+                                .await;
+                            }
+                        }
+                        continue;
+                    }
                 };
 
                 let expr = match self
@@ -562,6 +605,189 @@ impl Manager {
                     worklist.push((listener_svc, listener_def));
                 }
             }
+        }
+    }
+
+    /// #24: send a RequestUpdates to a remote service owner, subscribing
+    /// `listener_def` to the given members. Fire-and-forget: the owner replies
+    /// with Update messages that arrive through the normal receive loop.
+    async fn subscribe_remote(
+        &mut self,
+        owner: &str,
+        members: Vec<String>,
+        listener_service: ServiceId,
+        listener_def: &str,
+    ) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_SUB_ID: AtomicU64 = AtomicU64::new(1);
+
+        let addr = match self.remote_addr(owner) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let reply_to = self.local_reply_addr().await;
+        let request_id = NEXT_SUB_ID.fetch_add(1, Ordering::SeqCst);
+        let msg = MeerkatMessage::RequestUpdates {
+            request_id,
+            service: owner.to_string(),
+            members,
+            listener_service,
+            listener_def: listener_def.to_string(),
+            reply_to,
+        };
+        if let Some(net) = self.network.as_mut() {
+            net.handle_command(NetworkCommand::SendMessage { addr, msg })
+                .await;
+        }
+    }
+
+    /// #24: a remote listener has subscribed to members of one of our services.
+    /// Register it, remember where to reach it, and return one Update per member
+    /// carrying the current value (the initial notification).
+    pub fn handle_request_updates(
+        &mut self,
+        service: &str,
+        members: &[String],
+        listener_service: ServiceId,
+        listener_def: &str,
+        reply_to: &str,
+    ) -> Vec<MeerkatMessage> {
+        self.listener_addrs
+            .insert(listener_service.clone(), reply_to.to_string());
+
+        let mut updates = Vec::new();
+        for member in members {
+            if let Some(svc) = self.services.get_mut(service) {
+                svc.listeners
+                    .entry(member.clone())
+                    .or_default()
+                    .insert((listener_service.clone(), listener_def.to_string()));
+            }
+            let value = self
+                .services
+                .get(service)
+                .and_then(|s| s.vars.get(member))
+                .map(|vs| vs.value.clone());
+            if let Some(v) = value {
+                updates.push(MeerkatMessage::Update {
+                    listener_service: listener_service.clone(),
+                    listener_def: listener_def.to_string(),
+                    source_service: service.to_string(),
+                    member: member.clone(),
+                    value: serde_json::to_string(&v).unwrap_or_default(),
+                });
+            }
+        }
+        updates
+    }
+
+    /// #24: apply a change notification. Cache the dep's new value and, once all
+    /// of the def's cross-service deps are cached, recompute it from the cache
+    /// (no round-trip), write it back, and cascade to its own listeners.
+    pub async fn handle_update(
+        &mut self,
+        listener_service: ServiceId,
+        listener_def: &str,
+        source_service: &str,
+        member: &str,
+        value: Value,
+    ) {
+        let svc_name = match self
+            .services
+            .iter()
+            .find(|(_, s)| s.id == listener_service)
+            .map(|(n, _)| n.clone())
+        {
+            Some(n) => n,
+            None => return,
+        };
+
+        if let Some(svc) = self.services.get_mut(&svc_name) {
+            svc.dep_cache
+                .entry(listener_def.to_string())
+                .or_default()
+                .insert((source_service.to_string(), member.to_string()), value);
+        }
+
+        // Recompute only once every cross-service dep of this def is cached.
+        let (all_cached, cached) = match self.services.get(&svc_name) {
+            Some(svc) => match (
+                svc.dep_remote.get(listener_def),
+                svc.dep_cache.get(listener_def),
+            ) {
+                (Some(needed), Some(have)) => {
+                    let all = needed
+                        .iter()
+                        .all(|(s, mem)| have.contains_key(&(s.clone(), mem.clone())));
+                    (all, have.clone())
+                }
+                _ => (false, HashMap::new()),
+            },
+            None => (false, HashMap::new()),
+        };
+        if !all_cached {
+            return;
+        }
+
+        let expr = match self
+            .services
+            .get(&svc_name)
+            .and_then(|s| s.defs.get(listener_def))
+            .cloned()
+        {
+            Some(e) => e,
+            None => return,
+        };
+
+        // env = local vars plus each cached cross-service dep under its
+        // qualified name, so MemberAccess resolves from cache (see evaluator).
+        let mut env: Vec<(String, Value)> = self
+            .services
+            .get(&svc_name)
+            .map(|s| {
+                s.vars
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for ((s, mem), v) in &cached {
+            env.push((format!("{}.{}", s, mem), v.clone()));
+        }
+
+        let new_value = match eval(
+            &expr,
+            &env,
+            &mut EvalContext {
+                manager: self,
+                service_name: &svc_name,
+                txn: None,
+            },
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("reactive recompute of def '{}' failed: {}", listener_def, e);
+                return;
+            }
+        };
+
+        let changed = match self
+            .services
+            .get_mut(&svc_name)
+            .and_then(|s| s.vars.get_mut(listener_def))
+        {
+            Some(vs) => {
+                let differs = vs.value != new_value;
+                vs.value = new_value;
+                differs
+            }
+            None => false,
+        };
+
+        if changed {
+            self.propagate(&svc_name, listener_def).await;
         }
     }
 
@@ -1337,6 +1563,153 @@ impl Default for Manager {
 mod tests {
     use super::*;
     use crate::ast::{Decl, Expr, Value};
+
+    // #24: handle_request_updates registers a remote listener, records its
+    // address, and returns the current value as an initial Update.
+    #[tokio::test]
+    async fn test_handle_request_updates_registers_and_seeds() {
+        let mut manager = Manager::new();
+        let s1 = vec![
+            Decl::VarDecl {
+                name: "x".to_string(),
+                val: Expr::Literal {
+                    val: Value::Number { val: 1 },
+                },
+            },
+            Decl::DefDecl {
+                name: "y".to_string(),
+                val: Expr::Binop {
+                    op: crate::ast::BinOp::Add,
+                    expr1: Box::new(Expr::Variable {
+                        ident: "x".to_string(),
+                    }),
+                    expr2: Box::new(Expr::Literal {
+                        val: Value::Number { val: 1 },
+                    }),
+                },
+                is_pub: true,
+            },
+        ];
+        manager.create_service("s1".to_string(), s1).await.unwrap();
+
+        let listener = manager.id_for_service("watcher");
+        let updates = manager.handle_request_updates(
+            "s1",
+            &["y".to_string()],
+            listener.clone(),
+            "z",
+            "addr-of-watcher",
+        );
+
+        let on_y = manager
+            .services
+            .get("s1")
+            .unwrap()
+            .listeners
+            .get("y")
+            .cloned()
+            .unwrap_or_default();
+        assert!(on_y.iter().any(|(sid, d)| *sid == listener && d == "z"));
+        assert_eq!(
+            manager.listener_addrs.get(&listener).map(|s| s.as_str()),
+            Some("addr-of-watcher")
+        );
+        assert_eq!(updates.len(), 1);
+        match &updates[0] {
+            MeerkatMessage::Update {
+                source_service,
+                member,
+                listener_def,
+                value,
+                ..
+            } => {
+                assert_eq!(source_service, "s1");
+                assert_eq!(member, "y");
+                assert_eq!(listener_def, "z");
+                assert_eq!(
+                    value,
+                    &serde_json::to_string(&Value::Number { val: 2 }).unwrap()
+                );
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    // #24: handle_update caches the pushed value and recomputes the def FROM THE
+    // CACHE. We push a value that disagrees with the real local s1.y to prove the
+    // recompute used the cache (z = 99 + 2 = 101), not a fresh lookup (which
+    // would give 4).
+    #[tokio::test]
+    async fn test_handle_update_recomputes_from_cache() {
+        let mut manager = Manager::new();
+        let s1 = vec![
+            Decl::VarDecl {
+                name: "x".to_string(),
+                val: Expr::Literal {
+                    val: Value::Number { val: 1 },
+                },
+            },
+            Decl::DefDecl {
+                name: "y".to_string(),
+                val: Expr::Binop {
+                    op: crate::ast::BinOp::Add,
+                    expr1: Box::new(Expr::Variable {
+                        ident: "x".to_string(),
+                    }),
+                    expr2: Box::new(Expr::Literal {
+                        val: Value::Number { val: 1 },
+                    }),
+                },
+                is_pub: true,
+            },
+        ];
+        manager.create_service("s1".to_string(), s1).await.unwrap();
+        let s2 = vec![Decl::DefDecl {
+            name: "z".to_string(),
+            val: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::MemberAccess {
+                    service: "s1".to_string(),
+                    member: "y".to_string(),
+                }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Number { val: 2 },
+                }),
+            },
+            is_pub: true,
+        }];
+        manager.create_service("s2".to_string(), s2).await.unwrap();
+        let s2_id = manager.services.get("s2").unwrap().id.clone();
+
+        assert_eq!(
+            manager
+                .services
+                .get("s2")
+                .unwrap()
+                .vars
+                .get("z")
+                .unwrap()
+                .value,
+            Value::Number { val: 4 }
+        );
+
+        manager
+            .handle_update(s2_id, "z", "s1", "y", Value::Number { val: 99 })
+            .await;
+
+        assert_eq!(
+            manager
+                .services
+                .get("s2")
+                .unwrap()
+                .vars
+                .get("z")
+                .unwrap()
+                .value,
+            Value::Number { val: 101 },
+            "recompute must use the cached pushed value, not a fresh lookup"
+        );
+    }
 
     // #24: a def in one service that depends on another local service's member
     // updates eagerly through the cross-service listener cascade, not only

@@ -220,6 +220,16 @@ pub async fn eval(
         }
 
         Expr::MemberAccess { service, member } => {
+            // #24: a reactive recompute pre-seeds env with each cross-service
+            // dep's cached value under its qualified name "service.member" (the
+            // dot keeps it from colliding with any real identifier), so the
+            // recompute resolves from cache instead of a network round-trip.
+            let qualified = format!("{}.{}", service, member);
+            for (name, val) in env.iter().rev() {
+                if name == &qualified {
+                    return Ok(val.clone());
+                }
+            }
             // Manager figures out whether service is local or remote
             ctx.manager
                 .lookup(member, service, ctx.txn.as_deref_mut())
