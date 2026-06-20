@@ -304,6 +304,33 @@ impl Manager {
             }
         }
 
+        // #24: register this service's cross-service listeners. For each local
+        // def with cross-service deps, subscribe to each (owner, member): when
+        // the owner is a service on this same node, add (this service, def) to
+        // the owner's listener set so a later change to that member cascades
+        // here. Remote owners are subscribed over the wire in a later stage.
+        let this_id = match self.services.get(&svc_name) {
+            Some(s) => s.id.clone(),
+            None => return Ok(()),
+        };
+        let mut cross_links: Vec<(String, String, String)> = Vec::new();
+        if let Some(s) = self.services.get(&svc_name) {
+            for (def_name, refs) in &s.dep_remote {
+                for (owner, member) in refs {
+                    cross_links.push((def_name.clone(), owner.clone(), member.clone()));
+                }
+            }
+        }
+        for (def_name, owner, member) in cross_links {
+            if let Some(owner_svc) = self.services.get_mut(&owner) {
+                owner_svc
+                    .listeners
+                    .entry(member)
+                    .or_default()
+                    .insert((this_id.clone(), def_name));
+            }
+        }
+
         Ok(())
     }
 
@@ -442,49 +469,54 @@ impl Manager {
     }
 
     async fn propagate(&mut self, service_name: &str, changed_var: &str) {
-        // #24: event-driven local reactivity. Rather than scanning every def in
-        // topo order, walk the listener edges outward from the changed member:
-        // each local listener recomputes from current values and, when its own
-        // value changes, cascades to the members listening on it. This is the
-        // same mechanism cross-service updates use; only the transport differs.
-        // Remote listeners are notified over the wire in a later stage.
-        let self_id = match self.services.get(service_name) {
-            Some(s) => s.id.clone(),
-            None => return,
-        };
+        // #24: event-driven reactivity over the listener graph. A change to a
+        // member is pushed to its listeners; each local listener recomputes from
+        // current values and, when its own value changes, cascades to its own
+        // listeners. The worklist is keyed by (service, member) so a cascade can
+        // cross local service boundaries (s2.z listening on s1.y). A listener
+        // that resolves to another node is notified over the wire in a later
+        // stage.
+        let mut worklist: Vec<(String, String)> =
+            vec![(service_name.to_string(), changed_var.to_string())];
 
-        let mut worklist: Vec<String> = vec![changed_var.to_string()];
-        while let Some(member) = worklist.pop() {
-            // Local defs listening on this member, cloned out so that no borrow
-            // of self is held across the recompute below.
-            let listening_defs: Vec<String> = self
+        while let Some((svc, member)) = worklist.pop() {
+            let listeners: Vec<(ServiceId, String)> = self
                 .services
-                .get(service_name)
+                .get(&svc)
                 .and_then(|s| s.listeners.get(&member))
-                .map(|set| {
-                    set.iter()
-                        .filter(|(sid, _)| *sid == self_id)
-                        .map(|(_, def_name)| def_name.clone())
-                        .collect()
-                })
+                .map(|set| set.iter().cloned().collect())
                 .unwrap_or_default();
 
-            for def_name in listening_defs {
+            for (listener_id, listener_def) in listeners {
+                // Resolve the listener to a local service by id. A listener that
+                // is not local belongs to another node (handled over the wire in
+                // a later stage), so skip it here.
+                let listener_svc = match self
+                    .services
+                    .iter()
+                    .find(|(_, s)| s.id == listener_id)
+                    .map(|(n, _)| n.clone())
+                {
+                    Some(n) => n,
+                    None => continue,
+                };
+
                 let expr = match self
                     .services
-                    .get(service_name)
-                    .and_then(|s| s.defs.get(&def_name))
+                    .get(&listener_svc)
+                    .and_then(|s| s.defs.get(&listener_def))
                     .cloned()
                 {
                     Some(e) => e,
                     None => continue,
                 };
 
-                // Recompute from the service's current values, lockless, exactly
-                // as the previous topo-walk did.
+                // Recompute from the listener service's current values, lockless.
+                // Cross-service references resolve through lookup against the
+                // owner's current state (cheap while the owner is local).
                 let env: Vec<(String, Value)> = self
                     .services
-                    .get(service_name)
+                    .get(&listener_svc)
                     .map(|s| {
                         s.vars
                             .iter()
@@ -498,7 +530,7 @@ impl Manager {
                     &env,
                     &mut EvalContext {
                         manager: self,
-                        service_name,
+                        service_name: listener_svc.as_str(),
                         txn: None,
                     },
                 )
@@ -508,17 +540,15 @@ impl Manager {
                     Err(e) => {
                         // Propagation is best-effort; durable retry of failed
                         // updates is tracked under issue #24 (async updates).
-                        log::warn!("propagation of def '{}' failed: {}", def_name, e);
+                        log::warn!("propagation of def '{}' failed: {}", listener_def, e);
                         continue;
                     }
                 };
 
-                // Write the new value back; cascade only when it actually
-                // changed, so a no-op recompute does not re-trigger dependents.
                 let changed = match self
                     .services
-                    .get_mut(service_name)
-                    .and_then(|s| s.vars.get_mut(&def_name))
+                    .get_mut(&listener_svc)
+                    .and_then(|s| s.vars.get_mut(&listener_def))
                 {
                     Some(var_state) => {
                         let differs = var_state.value != value;
@@ -529,7 +559,7 @@ impl Manager {
                 };
 
                 if changed {
-                    worklist.push(def_name);
+                    worklist.push((listener_svc, listener_def));
                 }
             }
         }
